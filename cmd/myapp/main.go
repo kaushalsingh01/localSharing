@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/skip2/go-qrcode"
 )
 
 const (
@@ -43,6 +45,10 @@ func certDir() (string, error) {
 
 	home = filepath.Clean(home)
 
+	// On Windows, VolumeName("C:\\Users\\you") is "C:".
+	// Adding the separator produces the volume root "C:\\".
+	// On Unix, VolumeName is empty and the root is "/".
+	// Never store credentials directly in a filesystem root.
 	root := filepath.Clean(
 		filepath.VolumeName(home) + string(os.PathSeparator),
 	)
@@ -119,7 +125,7 @@ func primaryIP() net.IP {
 		return nil
 	}
 
-	return addr.IP
+	return addr.IP.To4()
 }
 
 func generateCertificate(
@@ -253,7 +259,7 @@ func loadOrCreateCertificate(
 			case now.After(leaf.NotAfter):
 				fmt.Fprintf(
 					os.Stderr,
-					"⚠ Existing certificate expired at %s; regenerating.\n"+
+					"Warning: existing certificate expired at %s; regenerating.\n"+
 						"  Previously paired clients must rescan.\n",
 					leaf.NotAfter.Format(time.RFC3339),
 				)
@@ -261,9 +267,9 @@ func loadOrCreateCertificate(
 			case now.Before(leaf.NotBefore):
 				fmt.Fprintf(
 					os.Stderr,
-					"⚠ Existing certificate not valid until %s "+
+					"Warning: existing certificate not valid until %s "+
 						"(server time: %s).\n"+
-						"  If this repeats, check your system clock.\n"+
+						"  Check your system clock if this repeats.\n"+
 						"  Regenerating.\n",
 					leaf.NotBefore.Format(time.RFC3339),
 					now.Format(time.RFC3339),
@@ -282,7 +288,7 @@ func loadOrCreateCertificate(
 		} else {
 			fmt.Fprintf(
 				os.Stderr,
-				"⚠ Existing certificate is unparseable (%v); regenerating.\n",
+				"Warning: existing certificate is unparseable (%v); regenerating.\n",
 				parseErr,
 			)
 		}
@@ -290,7 +296,7 @@ func loadOrCreateCertificate(
 		if !errors.Is(pairErr, fs.ErrNotExist) {
 			fmt.Fprintf(
 				os.Stderr,
-				"⚠ Existing certificate/key pair is unreadable (%v); regenerating.\n",
+				"Warning: existing certificate/key pair is unreadable (%v); regenerating.\n",
 				pairErr,
 			)
 		} else {
@@ -300,23 +306,24 @@ func loadOrCreateCertificate(
 			switch {
 			case errors.Is(certErr, fs.ErrNotExist) &&
 				errors.Is(keyErr, fs.ErrNotExist):
+				// First run: no existing certificate to lose.
 
 			case errors.Is(certErr, fs.ErrNotExist):
 				fmt.Fprintln(
 					os.Stderr,
-					"⚠ Existing certificate missing; regenerating.",
+					"Warning: existing certificate missing; regenerating.",
 				)
 
 			case errors.Is(keyErr, fs.ErrNotExist):
 				fmt.Fprintln(
 					os.Stderr,
-					"⚠ Existing private key missing; regenerating.",
+					"Warning: existing private key missing; regenerating.",
 				)
 
 			default:
 				fmt.Fprintln(
 					os.Stderr,
-					"⚠ Existing certificate/key pair is incomplete; regenerating.",
+					"Warning: existing certificate/key pair incomplete; regenerating.",
 				)
 			}
 		}
@@ -365,6 +372,17 @@ func fingerprint(
 	}
 
 	return hexForm, buf.String()
+}
+
+func qrGenerator(payload string) error {
+	qr, err := qrcode.New(payload, qrcode.Medium)
+	if err != nil {
+		return fmt.Errorf("generating QR code: %w", err)
+	}
+	fmt.Printf("\nQR payload: %s\n", payload)
+	fmt.Println("Scan this QR code:")
+	fmt.Print(qr.ToSmallString(false))
+	return nil
 }
 
 func main() {
@@ -432,6 +450,39 @@ func main() {
 		host, defaultPort)
 	fmt.Printf("  https://%s:%s (hostname; if resolvable)\n",
 		host, defaultPort)
+
+	qrIP := primary
+	if qrIP != nil {
+		inLAN := false
+		for _, ip := range ips {
+			if ip.Equal(qrIP) {
+				inLAN = true
+				break
+			}
+		}
+		if !inLAN {
+			fmt.Fprintf(os.Stderr,
+				"Note: primary route (%s) is not a local LAN IP; "+
+					"using %s for the QR instead.\n",
+				qrIP, ips[0],
+			)
+			qrIP = nil
+		}
+	}
+	if qrIP == nil && len(ips) > 0 {
+		qrIP = ips[0]
+	}
+	if qrIP != nil {
+		qrPayload := fmt.Sprintf(
+			"https://%s:%s/#fp=%s",
+			qrIP.String(), defaultPort, hexForm,
+		)
+		if err := qrGenerator(qrPayload); err != nil {
+			fmt.Fprintf(os.Stderr, "QR error: %v\n", err)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "No usable local IP; QR code was not generated.")
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir(absShareDir)))
